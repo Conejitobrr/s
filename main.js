@@ -105,6 +105,7 @@ async function startBot(opts = {}) {
     }
   });
 
+  sock.store = store; // 👈 Vital para que .ver rescate mensajes del store global
   sock.getCachedGroupMetadata = (jid) => getCachedGroupMetadata(sock, jid);
 
   if (useCode && phoneNum && !state.creds?.registered) {
@@ -182,13 +183,14 @@ async function startBot(opts = {}) {
       const remoteJid = msg?.key?.remoteJid;
       if (!msgId || !remoteJid || remoteJid === 'status@broadcast') continue;
 
+      // 🔥 Guardamos TODO mensaje entrante en la memoria global al instante (antes de filtros)
+      store.messages.set(msgId, msg);
+      setTimeout(() => store.messages.delete(msgId), 300000); // 5 minutos de retención
+
       if (type === 'append') {
         const msgTime = Number(msg.messageTimestamp || 0);
         if (msgTime && (nowSec - msgTime > 45)) continue;
       }
-
-      store.messages.set(msgId, msg);
-      setTimeout(() => store.messages.delete(msgId), 120000);
 
       if (msg.messageStubType) {
         const stubKey = `stub_${msgId}`;
@@ -201,18 +203,28 @@ async function startBot(opts = {}) {
       }
 
       const unwrapped = unwrapMessage(msg.message);
-      if (!msg.message || !unwrapped || Object.keys(unwrapped).length === 0) {
+
+      // Detectar si es un mensaje de "Ver una sola vez" para dejarlo pasar sin restricciones
+      const isViewOnce = !!(
+        unwrapped.viewOnceMessage ||
+        unwrapped.viewOnceMessageV2 ||
+        unwrapped.viewOnceMessageV2Extension ||
+        unwrapped.imageMessage?.viewOnce ||
+        unwrapped.videoMessage?.viewOnce ||
+        unwrapped.audioMessage?.viewOnce
+      );
+
+      if (!isViewOnce && (!msg.message || !unwrapped || Object.keys(unwrapped).length === 0)) {
         continue;
       }
 
-      // ✅ Permite que pasen los mensajes normales, los editados y los eliminados (para el Antidelete)
       const proto = unwrapped.protocolMessage || msg.message?.protocolMessage;
       const isDeleteEvent = proto && (proto.type === 0 || proto.type === 'REVOKE' || !!proto.key?.id);
       if (proto && !proto.editedMessage && !isDeleteEvent) {
         continue;
       }
 
-      if (processedMessages.has(msgId)) continue;
+      if (!isViewOnce && processedMessages.has(msgId)) continue;
       processedMessages.set(msgId, Date.now());
       setTimeout(() => processedMessages.delete(msgId), 90000);
 
