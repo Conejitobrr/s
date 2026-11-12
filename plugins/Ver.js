@@ -2,7 +2,7 @@
 
 const fs = require('fs');
 const path = require('path');
-const { downloadContentFromMessage } = require('@whiskeysockets/baileys');
+const { downloadMediaMessage } = require('@whiskeysockets/baileys');
 const { getContextInfo } = require('../lib/utils');
 
 const INV_PATH = path.join(process.cwd(), 'lib', 'inventario.json');
@@ -28,50 +28,6 @@ function findUserInvKey(dbInv, senderJid) {
   return clean;
 }
 
-// 🔍 Extractor robusto de la estructura interna del mensaje de Ver una sola vez
-function extractViewOncePayload(quotedMsg = {}) {
-  if (!quotedMsg) return null;
-
-  const inner =
-    quotedMsg.viewOnceMessage?.message ||
-    quotedMsg.viewOnceMessageV2?.message ||
-    quotedMsg.viewOnceMessageV2Extension?.message ||
-    quotedMsg.ephemeralMessage?.message?.viewOnceMessage?.message ||
-    quotedMsg.ephemeralMessage?.message?.viewOnceMessageV2?.message ||
-    quotedMsg.ephemeralMessage?.message?.viewOnceMessageV2Extension?.message ||
-    quotedMsg.ephemeralMessage?.message ||
-    quotedMsg;
-
-  const img = inner.imageMessage || quotedMsg.imageMessage;
-  const vid = inner.videoMessage || quotedMsg.videoMessage;
-  const aud = inner.audioMessage || quotedMsg.audioMessage;
-
-  if (img) return { type: 'image', media: img, mimetype: img.mimetype || 'image/jpeg', caption: img.caption || '' };
-  if (vid) return { type: 'video', media: vid, mimetype: vid.mimetype || 'video/mp4', caption: vid.caption || '' };
-  if (aud) return { type: 'audio', media: aud, mimetype: aud.mimetype || 'audio/ogg; codecs=opus', caption: '' };
-
-  return null;
-}
-
-// ⚡ Descarga segura del buffer con reintentos
-async function downloadToBuffer(media, type) {
-  if (!media) throw new Error('NO_MEDIA');
-  let lastErr = null;
-  for (let i = 1; i <= 3; i++) {
-    try {
-      const stream = await downloadContentFromMessage(media, type);
-      const chunks = [];
-      for await (const chunk of stream) chunks.push(chunk);
-      const buf = Buffer.concat(chunks);
-      if (buf && buf.length > 0) return buf;
-    } catch (e) {
-      lastErr = e;
-      await new Promise(r => setTimeout(r, 600 * i));
-    }
-  }
-  throw lastErr || new Error('DOWNLOAD_FAILED');
-}
-
 module.exports = {
   name: 'ver',
   aliases: ['rvo', 'revelar', 'viewonce'],
@@ -82,23 +38,29 @@ module.exports = {
     try {
       const ctx = getContextInfo(msg);
       const quotedId = ctx?.stanzaId || quoted?.key?.id || null;
-      let quotedMsg = ctx?.quotedMessage || quoted?.message || null;
+      let targetMsg = quoted?.message || ctx?.quotedMessage || null;
 
-      if (!quotedMsg && quotedId && sock.store && sock.store.messages) {
-        const storedMsg = sock.store.messages.get(quotedId);
-        if (storedMsg && storedMsg.message) {
-          quotedMsg = storedMsg.message;
+      // Si no viene en la cita directa, lo buscamos en el store global de mensajes del bot
+      if (!targetMsg && quotedId && sock.store && sock.store.messages) {
+        const stored = sock.store.messages.get(quotedId);
+        if (stored && stored.message) {
+          targetMsg = stored.message;
         }
       }
 
-      if (!quotedMsg) {
+      if (!targetMsg) {
         return reply('❌ Responde a una foto, video o audio de *"Ver una sola vez"* con *.ver*.');
       }
 
-      const payload = extractViewOncePayload(quotedMsg);
-      if (!payload) {
-        return reply('❌ El mensaje citado no contiene contenido multimedia.');
-      }
+      // Reconstruimos un objeto de mensaje válido para que Baileys lo descargue sin restricciones
+      const fullMsgObject = {
+        key: {
+          remoteJid,
+          id: quotedId,
+          participant: ctx?.participant || quoted?.key?.participant
+        },
+        message: targetMsg
+      };
 
       // 🎟️ Validar tickets de inventario si no es Owner
       const dbInv = getInv();
@@ -110,14 +72,20 @@ module.exports = {
         }
       }
 
-      let buffer;
+      // 🚀 Descarga nativa garantizada con Baileys
+      let mediaBuffer;
       try {
-        buffer = await downloadToBuffer(payload.media, payload.type);
-      } catch {
-        return reply('⚠️ No se pudo descargar el archivo. Es posible que el mensaje ya haya expirado en el servidor.');
+        mediaBuffer = await downloadMediaMessage(
+          fullMsgObject,
+          'buffer',
+          {},
+          { logger: { level: 'silent', child: () => ({ level: 'silent' }) } }
+        );
+      } catch (err) {
+        return reply('⚠️ No se pudo descargar el archivo. Es posible que el mensaje ya haya expirado en los servidores de WhatsApp.');
       }
 
-      if (!buffer || !buffer.length) {
+      if (!mediaBuffer || !mediaBuffer.length) {
         return reply('❌ El archivo multimedia está vacío.');
       }
 
@@ -126,15 +94,32 @@ module.exports = {
         saveInv(dbInv);
       }
 
-      const captionText = payload.caption ? `📝 *Texto:* ${payload.caption}` : '';
+      // Detectar el tipo de archivo para enviarlo correctamente
+      const inner =
+        targetMsg.viewOnceMessage?.message ||
+        targetMsg.viewOnceMessageV2?.message ||
+        targetMsg.viewOnceMessageV2Extension?.message ||
+        targetMsg.ephemeralMessage?.message?.viewOnceMessage?.message ||
+        targetMsg.ephemeralMessage?.message?.viewOnceMessageV2?.message ||
+        targetMsg.ephemeralMessage?.message?.viewOnceMessageV2Extension?.message ||
+        targetMsg.ephemeralMessage?.message ||
+        targetMsg;
 
-      // 🚀 Envío limpio como archivo multimedia normal (Esto sí aparece siempre en el chat)
-      if (payload.type === 'image') {
-        await sock.sendMessage(remoteJid, { image: buffer, caption: captionText }, { quoted: msg });
-      } else if (payload.type === 'video') {
-        await sock.sendMessage(remoteJid, { video: buffer, caption: captionText }, { quoted: msg });
-      } else if (payload.type === 'audio') {
-        await sock.sendMessage(remoteJid, { audio: buffer, mimetype: payload.mimetype, ptt: true }, { quoted: msg });
+      const isImage = inner.imageMessage || targetMsg.imageMessage;
+      const isVideo = inner.videoMessage || targetMsg.videoMessage;
+      const isAudio = inner.audioMessage || targetMsg.audioMessage;
+      const caption = isImage?.caption || isVideo?.caption || '';
+      const captionText = caption ? `📝 *Texto:* ${caption}` : '';
+
+      if (isImage) {
+        await sock.sendMessage(remoteJid, { image: mediaBuffer, caption: captionText }, { quoted: msg });
+      } else if (isVideo) {
+        await sock.sendMessage(remoteJid, { video: mediaBuffer, caption: captionText }, { quoted: msg });
+      } else if (isAudio) {
+        await sock.sendMessage(remoteJid, { audio: mediaBuffer, mimetype: isAudio.mimetype || 'audio/ogg; codecs=opus', ptt: true }, { quoted: msg });
+      } else {
+        // Fallback genérico si detecta cualquier otro archivo
+        await sock.sendMessage(remoteJid, { document: mediaBuffer, mimetype: 'application/octet-stream', fileName: 'archivo_revelado.bin', caption: captionText }, { quoted: msg });
       }
 
     } catch (err) {
