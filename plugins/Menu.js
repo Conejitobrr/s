@@ -46,7 +46,7 @@ module.exports = {
               {
                 title: '⚙️ UTILIDAD Y OTROS',
                 rows: [
-                  { header: '📜 Menú de Texto Completo', title: 'Ver todos los plugins', description: 'Muestra la lista detallada en texto', id: '.menucompleto' },
+                  { header: '📜 Menú de Texto Completo', title: 'Ver todos los plugins', description: 'Muestra la lista detallada en texto', id: '.menu2' },
                   { header: '🎵 Lista de Audios', title: 'Ver audios automáticos', description: 'Usa .audios', id: '.audios' },
                   { header: '📊 Estado del Bot', title: 'Rendimiento y servidores', description: 'Usa .estado', id: '.estado' }
                 ]
