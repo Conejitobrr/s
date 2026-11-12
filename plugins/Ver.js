@@ -3,14 +3,13 @@
 const fs = require('fs');
 const path = require('path');
 const { downloadContentFromMessage } = require('@whiskeysockets/baileys');
-const { getContextInfo } = require('../lib/utils');
 
 const INV_PATH = path.join(process.cwd(), 'lib', 'inventario.json');
 
-// 🧠 Memoria RAM global ampliada para todos los chats (privados, grupos y con uno mismo)
+// 🧠 Memoria automática: guarda las fotos "Ver una sola vez" apenas llegan al chat (antes de que las abras)
 const viewOnceCache = new Map();
 const lastInChat = new Map();
-const CACHE_TTL = 3 * 60 * 60 * 1000; // 3 horas de retención
+const CACHE_TTL = 60 * 60 * 1000; // Las recuerda por 1 hora
 
 function getInv() {
   try { return JSON.parse(fs.readFileSync(INV_PATH, 'utf8')); } catch { return {}; }
@@ -36,15 +35,6 @@ function findUserInvKey(dbInv, senderJid) {
 function extractViewOnceMedia(msgObj = {}) {
   if (!msgObj) return null;
 
-  const isWrappedVO = !!(
-    msgObj.viewOnceMessage ||
-    msgObj.viewOnceMessageV2 ||
-    msgObj.viewOnceMessageV2Extension ||
-    msgObj.ephemeralMessage?.message?.viewOnceMessage ||
-    msgObj.ephemeralMessage?.message?.viewOnceMessageV2 ||
-    msgObj.ephemeralMessage?.message?.viewOnceMessageV2Extension
-  );
-
   const inner =
     msgObj.viewOnceMessage?.message ||
     msgObj.viewOnceMessageV2?.message ||
@@ -55,13 +45,13 @@ function extractViewOnceMedia(msgObj = {}) {
     msgObj.ephemeralMessage?.message ||
     msgObj;
 
-  if (inner.imageMessage && (inner.imageMessage.viewOnce || isWrappedVO)) {
+  if (inner.imageMessage && (inner.imageMessage.viewOnce || msgObj.viewOnceMessage || msgObj.viewOnceMessageV2 || msgObj.viewOnceMessageV2Extension)) {
     return { type: 'image', media: inner.imageMessage, mimetype: inner.imageMessage.mimetype || 'image/jpeg', caption: inner.imageMessage.caption || '' };
   }
-  if (inner.videoMessage && (inner.videoMessage.viewOnce || isWrappedVO)) {
+  if (inner.videoMessage && (inner.videoMessage.viewOnce || msgObj.viewOnceMessage || msgObj.viewOnceMessageV2 || msgObj.viewOnceMessageV2Extension)) {
     return { type: 'video', media: inner.videoMessage, mimetype: inner.videoMessage.mimetype || 'video/mp4', caption: inner.videoMessage.caption || '' };
   }
-  if (inner.audioMessage && (inner.audioMessage.viewOnce || isWrappedVO)) {
+  if (inner.audioMessage && (inner.audioMessage.viewOnce || msgObj.viewOnceMessage || msgObj.viewOnceMessageV2 || msgObj.viewOnceMessageV2Extension)) {
     return { type: 'audio', media: inner.audioMessage, mimetype: inner.audioMessage.mimetype || 'audio/ogg; codecs=opus', caption: '' };
   }
   return null;
@@ -97,9 +87,9 @@ module.exports = {
   name: 'ver',
   aliases: ['rvo', 'revelar', 'viewonce'],
   category: 'utilidad & búsqueda',
-  desc: 'Revela mensajes de "Ver una sola vez" en chats privados, grupos y contigo mismo',
+  desc: 'Revela mensajes de "Ver una sola vez" en privado o grupos',
 
-  // 📡 Captura automática universal en todos los chats (incluyendo chats propios)
+  // 📡 Captura el archivo apenas entra al chat (antes de que quede "Abierto")
   onMessage: async ({ msg, remoteJid }) => {
     try {
       if (!msg?.message || !msg?.key?.id) return;
@@ -131,28 +121,20 @@ module.exports = {
     } catch {}
   },
 
-  execute: async ({ sock, msg, remoteJid, sender, isOwner, quoted, reply }) => {
+  execute: async ({ sock, msg, remoteJid, sender, isOwner, reply }) => {
     try {
-      const ctx = getContextInfo(msg);
-      const quotedId = ctx?.stanzaId || quoted?.key?.id || null;
-      let quotedMsg = ctx?.quotedMessage || quoted?.message || null;
+      const ctx = msg.message?.extendedTextMessage?.contextInfo;
+      const quotedId = ctx?.stanzaId || null;
+      const quotedMsg = ctx?.quotedMessage || null;
 
       let targetData = null;
 
-      // 1. Buscar en la caché de memoria RAM
+      // 1. Buscar en la memoria automática por ID del mensaje citado (funciona aunque ya diga "Abierto")
       if (quotedId && viewOnceCache.has(quotedId)) {
         targetData = viewOnceCache.get(quotedId);
       }
 
-      // 2. Si no está en RAM pero el usuario citó un mensaje, intentamos rescatarlo del store global del bot
-      if (!targetData && quotedId && sock.store && sock.store.messages) {
-        const storedMsg = sock.store.messages.get(quotedId);
-        if (storedMsg && storedMsg.message) {
-          quotedMsg = storedMsg.message;
-        }
-      }
-
-      // 3. Extraer de la cita si existe
+      // 2. Si no estaba en memoria, intentar extraer directo de la cita (funciona si aún no se ha abierto)
       if (!targetData && quotedMsg) {
         const fromQuote = extractFromQuoted(quotedMsg);
         if (fromQuote) {
@@ -166,7 +148,7 @@ module.exports = {
         }
       }
 
-      // 4. Si puso .ver sin citar nada, buscar el último elemento "Ver una sola vez" del chat actual
+      // 3. Si puso .ver sin citar nada, revelar la última foto de 1 vez de ese chat
       if (!targetData && !quotedMsg) {
         const lastId = lastInChat.get(remoteJid);
         if (lastId && viewOnceCache.has(lastId)) {
@@ -178,7 +160,7 @@ module.exports = {
         return reply('❌ Responde a una foto, video o audio de *"Ver una sola vez"* con *.ver*.');
       }
 
-      // 🎟️ Verificar tickets de uso (excepto para el Owner)
+      // 🎟️ Verificar ticket si lo usa otra persona que no seas tú (Owner)
       const dbInv = getInv();
       const invKey = findUserInvKey(dbInv, sender);
       if (!isOwner) {
@@ -193,7 +175,10 @@ module.exports = {
         try {
           finalBuffer = await downloadToBuffer(targetData.media, targetData.type);
         } catch (err) {
-          return reply('⚠️ No se pudo descargar el contenido multimedia. Es posible que el servidor de WhatsApp haya expirado el enlace de este archivo antiguo.');
+          if (err.message === 'EMPTY_MEDIA_KEY' || String(err.message).includes('empty media key')) {
+            return reply('⚠️ Esta foto ya había sido abierta (*Abierto*) antes de que el bot pudiera guardarla en memoria. Con las nuevas que te envíen ya podrás usar *.ver* incluso después de abrirlas.');
+          }
+          throw err;
         }
       }
 
@@ -214,7 +199,7 @@ module.exports = {
 
     } catch (err) {
       console.log('❌ Error enviando media en .ver:', err?.message || err);
-      return reply('❌ No se pudo recuperar el archivo multimedia.');
+      return reply('❌ No se pudo recuperar el archivo.');
     }
   }
 };
