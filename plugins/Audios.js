@@ -5,6 +5,7 @@ const path = require('path');
 const { execFile, exec } = require('child_process');
 const { promisify } = require('util');
 const { downloadContentFromMessage } = require('@whiskeysockets/baileys');
+const { getContextInfo } = require('../lib/utils');
 
 const execFileAsync = promisify(execFile);
 const execAsync = promisify(exec);
@@ -12,13 +13,12 @@ const execAsync = promisify(exec);
 // 🗄️ RUTAS LOCALES
 const MEDIA_DIR = path.join(process.cwd(), 'media');
 const TEMP_DIR = path.join(process.cwd(), 'temp');
-const VOICE_CACHE_DIR = path.join(TEMP_DIR, 'voice_cache');
 const CUSTOM_DB = path.join(process.cwd(), 'lib', 'custom_audios.json');
 
 const AUDIO_EXTENSIONS = ['.mp3', '.ogg', '.opus', '.wav', '.m4a', '.aac', '.flac', '.webm', '.mp4', '.mpeg'];
 
 const cooldowns = new Map();
-const COOLDOWN_TIME = 8000; // 8 segundos
+const COOLDOWN_TIME = 6000; // 6 segundos anti-spam
 
 // 🎵 AUDIOS BASE
 const BASE_AUDIOS = [
@@ -58,7 +58,6 @@ const BASE_AUDIOS = [
 function ensureSetup() {
   if (!fs.existsSync(MEDIA_DIR)) fs.mkdirSync(MEDIA_DIR, { recursive: true });
   if (!fs.existsSync(TEMP_DIR)) fs.mkdirSync(TEMP_DIR, { recursive: true });
-  if (!fs.existsSync(VOICE_CACHE_DIR)) fs.mkdirSync(VOICE_CACHE_DIR, { recursive: true });
   const libDir = path.dirname(CUSTOM_DB);
   if (!fs.existsSync(libDir)) fs.mkdirSync(libDir, { recursive: true });
   if (!fs.existsSync(CUSTOM_DB)) fs.writeFileSync(CUSTOM_DB, '[]');
@@ -76,10 +75,11 @@ function normalizeFileName(name = '') {
   return normalize(name).trim().replace(/\s+/g, ' ');
 }
 
+// 🔍 Busca el archivo en ./media sin importar mayúsculas, tildes o extensión
 function resolveAudioFile(file = '') {
   if (!file) return null;
   const directPath = path.resolve(MEDIA_DIR, file);
-  if (fs.existsSync(directPath)) return directPath;
+  if (fs.existsSync(directPath) && fs.statSync(directPath).isFile()) return directPath;
 
   const wantedExt = path.extname(file).toLowerCase();
   const wantedBase = normalizeFileName(wantedExt ? path.basename(file, wantedExt) : path.basename(file));
@@ -97,44 +97,52 @@ function resolveAudioFile(file = '') {
   return null;
 }
 
-// ⚡ Convierte una sola vez y guarda en caché para envío instantáneo
-async function getOrConvertVoice(inputPath) {
-  const stat = fs.statSync(inputPath);
-  const cacheName = `${path.basename(inputPath)}_${stat.size}.ogg`;
-  const cachedOgg = path.join(VOICE_CACHE_DIR, cacheName);
+// 📂 Combina BASE_AUDIOS + custom_audios.json + todos los archivos sueltos en ./media
+function getAllAvailableAudios() {
+  let customAudios = [];
+  try { customAudios = JSON.parse(fs.readFileSync(CUSTOM_DB, 'utf-8')); } catch {}
 
-  if (fs.existsSync(cachedOgg) && fs.statSync(cachedOgg).size > 0) {
-    return cachedOgg;
+  const combined = [...BASE_AUDIOS, ...customAudios];
+  const knownTriggers = new Set(combined.flatMap(a => a.triggers.map(t => normalize(t))));
+
+  // Auto-detecta cualquier archivo en ./media que no esté en la lista
+  if (fs.existsSync(MEDIA_DIR)) {
+    const files = fs.readdirSync(MEDIA_DIR);
+    for (const item of files) {
+      const ext = path.extname(item).toLowerCase();
+      if (!AUDIO_EXTENSIONS.includes(ext)) continue;
+      const baseName = path.basename(item, ext).trim();
+      const normTrigger = normalize(baseName);
+      if (normTrigger && !knownTriggers.has(normTrigger)) {
+        combined.push({ triggers: [baseName.toLowerCase()], file: item });
+        knownTriggers.add(normTrigger);
+      }
+    }
   }
 
-  await execFileAsync('ffmpeg', [
-    '-y', '-i', inputPath,
-    '-vn', '-map', '0:a:0', '-af', 'aresample=async=1:first_pts=0',
-    '-c:a', 'libopus', '-application', 'voip', '-b:a', '48k',
-    '-ar', '48000', '-ac', '1', '-frame_duration', '20', '-f', 'ogg',
-    cachedOgg
-  ], { timeout: 60000 });
-
-  return cachedOgg;
+  return { combined, customAudios };
 }
 
-// ☁️ SINCRONIZADOR AUTOMÁTICO CON GITHUB DESDE WHATSAPP
+async function convertToVoice(input, output) {
+  await execFileAsync('ffmpeg', [
+    '-y', '-i', input,
+    '-vn', '-c:a', 'libopus',
+    '-b:a', '48k', '-ar', '48000', '-ac', '1',
+    '-f', 'ogg', output
+  ], { timeout: 45000 });
+}
+
+// ☁️ SINCRONIZADOR AUTOMÁTICO CON GITHUB
 async function syncMediaToGitHub(filesToTrack = [], commitMsg = '🎵 Audio actualizado desde WhatsApp') {
   try {
     const token = process.env.GITHUB_TOKEN || '';
-    const repo = process.env.GITHUB_REPO || ''; // Ejemplo: Conejitobrr/siriusbot-v3
+    const repo = process.env.GITHUB_REPO || '';
 
-    // 1. Configurar identidad Git local por si Termux es nuevo
     await execAsync('git config user.name "SiriusBot" && git config user.email "siriusbot@users.noreply.github.com"').catch(() => {});
-
-    // 2. Forzar agregado de archivos (-f ignora bloqueos de .gitignore para media/)
     const quotedFiles = filesToTrack.map(f => `"${f}"`).join(' ');
     await execAsync(`git add -f ${quotedFiles}`);
-
-    // 3. Commit
     await execAsync(`git commit -m "${commitMsg}"`);
 
-    // 4. Push (Usa GITHUB_TOKEN si está en .env, o el origin normal de Termux)
     if (token && repo) {
       await execAsync(`git push https://${token}@github.com/${repo}.git HEAD:main`);
     } else {
@@ -148,17 +156,16 @@ async function syncMediaToGitHub(filesToTrack = [], commitMsg = '🎵 Audio actu
 
 module.exports = {
   name: 'audios_pasivos',
-  aliases: ['addaudio', 'añadiraudio', 'delaudio', 'borraraudio', 'audios', 'listaaudios', 'subirmedia'],
+  aliases: ['addaudio', 'añadiraudio', 'delaudio', 'borraraudio', 'audios', 'listaaudios'],
   category: 'multimedia',
-  desc: 'Añade, elimina, sube a GitHub o mira la lista de audios automáticos',
+  desc: 'Añade, elimina o mira la lista de audios automáticos',
 
   execute: async ({ sock, msg, remoteJid, args, commandName, isAdmin, isOwner, quoted, reply }) => {
     ensureSetup();
 
     // 📋 1. VER LISTA DE AUDIOS
     if (commandName === 'audios' || commandName === 'listaaudios' || commandName === 'audios_pasivos') {
-      let customAudios = [];
-      try { customAudios = JSON.parse(fs.readFileSync(CUSTOM_DB, 'utf-8')); } catch {}
+      const { customAudios } = getAllAvailableAudios();
 
       let texto = `╔══════════════════════╗\n`;
       texto += `        🎵 *LISTA DE AUDIOS* 🎵\n`;
@@ -169,119 +176,88 @@ module.exports = {
       texto += `_${baseTriggers.join(' • ')}_\n\n`;
 
       if (customAudios.length > 0) {
-        texto += `💎 *Audios Personalizados:*\n`;
+        texto += `💎 *Audios Añadidos:*\n`;
         const customTriggers = customAudios.map(a => a.triggers[0]).sort();
         texto += `_${customTriggers.join(' • ')}_\n`;
       } else {
-        texto += `💎 *Audios Personalizados:*\n_Aún no hay audios añadidos._\n`;
+        texto += `💎 *Audios Añadidos:*\n_Aún no hay audios personalizados._\n`;
       }
 
-      texto += `\n💡 _Escribe cualquiera de estas palabras en el chat y enviaré la nota de voz._`;
+      texto += `\n💡 _Escribe cualquiera de estas palabras en el chat y el bot enviará la nota de voz._`;
       return reply(texto);
     }
 
     if (!isAdmin && !isOwner) {
-      return reply('❌ Solo los Administradores o el Owner del bot pueden modificar los audios.');
+      return reply('❌ Solo los Administradores o el Creador del bot pueden añadir o borrar audios.');
     }
 
     const triggerWord = args.join(' ').trim();
     const triggerLower = triggerWord.toLowerCase();
 
-    // ☁️ 2. SUBIR ARCHIVO DIRECTO A CARPETA MEDIA DE GITHUB (.subirmedia Nombre)
-    if (commandName === 'subirmedia') {
-      if (!isOwner) return reply('❌ Solo el Owner puede subir archivos base directamente a GitHub.');
-      if (!triggerWord) return reply('❌ Escribe el nombre con el que se guardará en la carpeta *media/*.\n\n📌 *Ejemplo:* Responde a un audio y escribe:\n*.subirmedia Telepatía*');
-
-      const qMsg = quoted?.message || msg.message?.extendedTextMessage?.contextInfo?.quotedMessage;
-      const mediaContent = qMsg?.audioMessage || qMsg?.videoMessage || qMsg?.documentMessage;
-      const mediaType = qMsg?.audioMessage ? 'audio' : (qMsg?.videoMessage ? 'video' : (qMsg?.documentMessage ? 'document' : null));
-
-      if (!mediaContent || !mediaType) {
-        return reply('❌ Responde a un *Audio*, *Video* o *Documento* para subirlo a la carpeta `media/`.');
-      }
-
-      await reply('⏳ _Procesando audio y subiendo a la carpeta media/ de GitHub..._');
-
-      const tempInput = path.join(TEMP_DIR, `raw_${Date.now()}`);
-      const cleanName = triggerWord.replace(/\.mp3$/i, '').replace(/[\\/:*?"<>|]/g, '');
-      const finalFileName = `${cleanName}.mp3`;
-      const outputMp3 = path.join(MEDIA_DIR, finalFileName);
-
-      try {
-        const stream = await downloadContentFromMessage(mediaContent, mediaType);
-        let buffer = Buffer.from([]);
-        for await (const chunk of stream) buffer = Buffer.concat([buffer, chunk]);
-        fs.writeFileSync(tempInput, buffer);
-
-        await execFileAsync('ffmpeg', ['-y', '-i', tempInput, '-vn', '-c:a', 'libmp3lame', '-b:a', '128k', outputMp3]);
-        if (fs.existsSync(tempInput)) fs.unlinkSync(tempInput);
-
-        const gitRes = await syncMediaToGitHub([`media/${finalFileName}`], `Subido media/${finalFileName} desde WhatsApp`);
-
-        if (gitRes.ok) {
-          return reply(`✅ *¡Archivo guardado y subido a GitHub!*\n\n📂 Ruta: \`media/${finalFileName}\`\n☁️ Sincronizado en tu repositorio.`);
-        } else {
-          return reply(`✅ *Guardado localmente en:* \`media/${finalFileName}\`\n⚠️ *Nota GitHub:* No se pudo hacer push automático (Configura \`GITHUB_TOKEN\` y \`GITHUB_REPO\` en tu \`.env\`).`);
-        }
-      } catch (e) {
-        if (fs.existsSync(tempInput)) fs.unlinkSync(tempInput);
-        return reply(`❌ Error procesando el archivo: ${e.message}`);
-      }
-    }
-
-    // 🗑️ 3. ELIMINAR AUDIO (.delaudio)
+    // 🗑️ 2. ELIMINAR AUDIO (.delaudio)
     if (commandName.startsWith('del') || commandName.startsWith('borrar')) {
-      if (!triggerLower) return reply('❌ Escribe la palabra clave del audio que quieres eliminar.\n\n📌 *Ejemplo:*\n.delaudio ahhh');
+      if (!triggerLower) return reply('❌ Escribe la palabra clave del audio que quieres eliminar.\n\n📌 *Ejemplo:*\n.delaudio nooo');
 
       let customAudios = [];
       try { customAudios = JSON.parse(fs.readFileSync(CUSTOM_DB, 'utf-8')); } catch {}
 
-      const index = customAudios.findIndex(a => a.triggers.includes(triggerLower));
-      if (index === -1) {
-        return reply(`❌ No encontré ningún audio personalizado con la palabra "${triggerLower}".`);
+      const index = customAudios.findIndex(a => a.triggers.map(t => t.toLowerCase()).includes(triggerLower));
+      const directFile = resolveAudioFile(triggerLower);
+
+      if (index === -1 && !directFile) {
+        return reply(`❌ No encontré ningún audio guardado con la palabra "${triggerWord}".`);
       }
 
-      const fileName = customAudios[index].file;
-      const fileToDelete = path.join(MEDIA_DIR, fileName);
-      try { if (fs.existsSync(fileToDelete)) fs.unlinkSync(fileToDelete); } catch {}
+      let deletedFileName = `${triggerLower}.mp3`;
+      if (index !== -1) {
+        deletedFileName = customAudios[index].file;
+        const fileToDelete = path.join(MEDIA_DIR, deletedFileName);
+        try { if (fs.existsSync(fileToDelete)) fs.unlinkSync(fileToDelete); } catch {}
+        customAudios.splice(index, 1);
+        fs.writeFileSync(CUSTOM_DB, JSON.stringify(customAudios, null, 2));
+      } else if (directFile) {
+        deletedFileName = path.basename(directFile);
+        try { fs.unlinkSync(directFile); } catch {}
+      }
 
-      customAudios.splice(index, 1);
-      fs.writeFileSync(CUSTOM_DB, JSON.stringify(customAudios, null, 2));
-
-      syncMediaToGitHub([`media/${fileName}`, 'lib/custom_audios.json'], `Eliminado audio ${triggerLower}`).catch(() => {});
+      syncMediaToGitHub([`media/${deletedFileName}`, 'lib/custom_audios.json'], `Eliminado audio: ${triggerLower}`).catch(() => {});
 
       return reply(`✅ *Audio eliminado con éxito.*\n\nYa no responderé cuando digan "${triggerLower}".`);
     }
 
-    // ➕ 4. AGREGAR AUDIO PERSONALIZADO Y SUBIR A GITHUB (.addaudio)
+    // ➕ 3. AGREGAR AUDIO CON EL NOMBRE EXACTO (.addaudio nooo -> media/nooo.mp3)
     if (commandName.startsWith('add') || commandName.startsWith('añadir')) {
       try {
-        const qMsg = quoted?.message || msg.message?.extendedTextMessage?.contextInfo?.quotedMessage;
+        const ctxInfo = getContextInfo(msg);
+        const qMsg = quoted?.message || ctxInfo?.quotedMessage;
         const isVideo = qMsg?.videoMessage;
         const isAudio = qMsg?.audioMessage;
         const isDocument = qMsg?.documentMessage;
 
         if (!isVideo && !isAudio && !isDocument) {
-          return reply('❌ Debes responder a un *Video* o *Audio*.\n\n📌 *Ejemplo:* Responde al audio y escribe:\n*.addaudio wazaa*');
+          return reply('❌ Debes responder a un *Audio* o *Video*.\n\n📌 *Ejemplo:* Responde al audio y escribe:\n*.addaudio nooo*');
         }
 
         if (!triggerLower) {
-          return reply('❌ Escribe la palabra que activará el audio.\n\n📌 *Ejemplo:*\n.addaudio wazaa');
+          return reply('❌ Escribe la palabra que activará el audio.\n\n📌 *Ejemplo:*\n.addaudio nooo');
         }
+
+        // Limpia caracteres prohibidos en nombres de archivo, pero conserva el nombre exacto (ej: "nooo.mp3")
+        const cleanFileBase = triggerWord.replace(/[\\/:*?"<>|]/g, '').trim();
+        if (!cleanFileBase) {
+          return reply('❌ El nombre contiene símbolos no válidos.');
+        }
+
+        const finalFileName = `${cleanFileBase}.mp3`;
+        const outputMp3 = path.join(MEDIA_DIR, finalFileName);
 
         let customAudios = [];
         try { customAudios = JSON.parse(fs.readFileSync(CUSTOM_DB, 'utf-8')); } catch {}
-
-        if (customAudios.some(a => a.triggers.includes(triggerLower)) || BASE_AUDIOS.some(a => a.triggers.includes(triggerLower))) {
-          return reply(`⚠️ La palabra "${triggerLower}" ya tiene un audio asignado. Usa *.delaudio ${triggerLower}* primero.`);
-        }
 
         await sock.sendPresenceUpdate('composing', remoteJid);
 
         const id = `${Date.now()}`;
         const inputMedia = path.join(TEMP_DIR, `in_${id}.tmp`);
-        const safeName = `custom_${triggerLower.replace(/[^a-z0-9]/gi, '')}_${id}.mp3`;
-        const outputMp3 = path.join(MEDIA_DIR, safeName);
 
         let mediaType = 'video';
         let mediaContent = isVideo;
@@ -301,21 +277,24 @@ module.exports = {
 
         if (fs.existsSync(inputMedia)) fs.unlinkSync(inputMedia);
 
-        customAudios.push({ triggers: [triggerLower], file: safeName });
+        // Si ya existía en customAudios lo actualiza, si no, lo agrega
+        const existingIdx = customAudios.findIndex(a => a.triggers.includes(triggerLower));
+        if (existingIdx !== -1) {
+          customAudios[existingIdx].file = finalFileName;
+        } else {
+          customAudios.push({ triggers: [triggerLower], file: finalFileName });
+        }
         fs.writeFileSync(CUSTOM_DB, JSON.stringify(customAudios, null, 2));
 
-        // Pre-cachear en .ogg para que esté listo al instante
-        await getOrConvertVoice(outputMp3).catch(() => {});
+        // Subir a GitHub con el nombre limpio (ej: media/nooo.mp3)
+        const gitSync = await syncMediaToGitHub([`media/${finalFileName}`, 'lib/custom_audios.json'], `Audio agregado: ${finalFileName}`);
 
-        // Subir a GitHub en segundo plano
-        const gitSync = await syncMediaToGitHub([`media/${safeName}`, 'lib/custom_audios.json'], `Nuevo audio: ${triggerLower}`);
-
-        const githubStatus = gitSync.ok
-          ? '☁️ _Respaldado automáticamente en tu GitHub._'
-          : '💾 _Guardado en la memoria local de Termux._';
+        const gitMsg = gitSync.ok
+          ? `☁️ Subido a GitHub como: *media/${finalFileName}*`
+          : `💾 Guardado en: *media/${finalFileName}*`;
 
         await sock.sendMessage(remoteJid, {
-          text: `✅ *¡Audio registrado con éxito!*\n\n🎙️ Palabra clave: *"${triggerLower}"*\n${githubStatus}`
+          text: `✅ *¡Audio registrado con éxito!*\n\n🎙️ Palabra clave: *"${triggerLower}"*\n📂 Archivo: *${finalFileName}*\n${gitMsg}`
         }, { quoted: msg });
 
       } catch (err) {
@@ -325,30 +304,31 @@ module.exports = {
     }
   },
 
-  // 2️⃣ ESCUCHA PASIVA ULTRA RÁPIDA
-  onMessage: async ({ sock, remoteJid, body, fromGroup, msg, quoted, groupData, userData }) => {
-    if (!body || msg.key?.fromMe) return;
-    if (body.trim().startsWith('.')) return;
+  // 2️⃣ SISTEMA AUTOMÁTICO DE ESCUCHA (Detecta todas las palabras sin fallar)
+  onMessage: async ({ sock, remoteJid, body, fromGroup, msg, groupData, userData }) => {
+    if (!body) return;
+    const rawTrimmed = body.trim();
+    if (rawTrimmed.startsWith('.') || rawTrimmed.startsWith('!') || rawTrimmed.startsWith('#') || rawTrimmed.startsWith('/')) return;
 
     if (fromGroup && groupData && groupData.audios === false) return;
     if (!fromGroup && userData && userData.audios === false) return;
 
     ensureSetup();
-    const text = normalize(body);
+    const text = normalize(rawTrimmed);
 
-    let customAudios = [];
-    try { customAudios = JSON.parse(fs.readFileSync(CUSTOM_DB, 'utf-8')); } catch {}
-
-    const allAudios = [...BASE_AUDIOS, ...customAudios];
+    const { combined } = getAllAvailableAudios();
     let selected = null;
 
-    for (const audio of allAudios) {
+    for (const audio of combined) {
       for (const trigger of audio.triggers) {
-        const t = normalize(trigger);
+        const t = normalize(trigger).trim();
+        if (!t) continue;
+
         if (t.includes(' ')) {
           if (text.includes(t)) { selected = audio; break; }
         } else {
-          const regex = new RegExp(`\\b${escapeRegExp(t)}\\b`, 'i');
+          // Detector exacto de palabra aislada (compatible con tildes, signos y emojis alrededor)
+          const regex = new RegExp(`(?:^|[^a-z0-9])${escapeRegExp(t)}(?:$|[^a-z0-9])`, 'i');
           if (regex.test(text)) { selected = audio; break; }
         }
       }
@@ -363,29 +343,49 @@ module.exports = {
     const input = resolveAudioFile(selected.file);
     if (!input || !fs.existsSync(input)) return;
 
+    const output = path.join(TEMP_DIR, `voice_${Date.now()}_${Math.floor(Math.random() * 9999)}.ogg`);
+
     try {
       cooldowns.set(remoteJid, Date.now());
       await sock.sendPresenceUpdate('recording', remoteJid);
 
-      const oggPath = await getOrConvertVoice(input);
-      if (!fs.existsSync(oggPath)) return;
-
-      // Si el usuario citó a alguien al decir la palabra clave, le responde al mensaje citado
+      // Si el usuario citó a alguien al decir la palabra clave, responde al mensaje citado
       let targetQuote = msg;
-      if (quoted && quoted.key?.id) {
+      const contextInfo = getContextInfo(msg);
+      if (contextInfo && contextInfo.stanzaId && contextInfo.participant) {
         targetQuote = {
-          key: quoted.key,
-          message: quoted.message || {}
+          key: {
+            remoteJid: msg.key.remoteJid,
+            id: contextInfo.stanzaId,
+            participant: contextInfo.participant
+          },
+          message: contextInfo.quotedMessage || {}
         };
       }
 
+      try {
+        await convertToVoice(input, output);
+        if (fs.existsSync(output) && fs.statSync(output).size > 0) {
+          await sock.sendMessage(
+            remoteJid,
+            { audio: fs.readFileSync(output), mimetype: 'audio/ogg; codecs=opus', ptt: true },
+            { quoted: targetQuote }
+          );
+          return;
+        }
+      } catch {}
+
+      // Respaldo directo en MP3 si FFmpeg opus llegara a fallar
       await sock.sendMessage(
         remoteJid,
-        { audio: fs.readFileSync(oggPath), mimetype: 'audio/ogg; codecs=opus', ptt: true },
+        { audio: fs.readFileSync(input), mimetype: 'audio/mpeg', ptt: true },
         { quoted: targetQuote }
       );
+
     } catch (err) {
       console.log('❌ Error enviando audio pasivo:', err?.message || err);
+    } finally {
+      try { if (fs.existsSync(output)) fs.unlinkSync(output); } catch {}
     }
   }
 };
