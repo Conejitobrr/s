@@ -2,7 +2,7 @@
 
 const fs = require('fs');
 const path = require('path');
-const { getContextInfo } = require('../lib/utils');
+const { downloadMediaMessage } = require('@whiskeysockets/baileys');
 
 const INV_PATH = path.join(process.cwd(), 'lib', 'inventario.json');
 
@@ -27,41 +27,30 @@ function findUserInvKey(dbInv, senderJid) {
   return clean;
 }
 
+function getContextInfo(msg) {
+  const m = msg.message || {};
+  return m.extendedTextMessage?.contextInfo ||
+         m.imageMessage?.contextInfo ||
+         m.videoMessage?.contextInfo ||
+         m.audioMessage?.contextInfo ||
+         m.documentMessage?.contextInfo || null;
+}
+
 module.exports = {
   name: 'ver',
   aliases: ['rvo', 'revelar', 'viewonce'],
   category: 'utilidad & búsqueda',
-  desc: 'Reenvía cualquier mensaje o multimedia de "Ver una sola vez"',
+  desc: 'Revela mensajes de "Ver una sola vez" respondiendo directamente al mensaje',
 
-  execute: async ({ sock, msg, remoteJid, sender, isOwner, quoted, reply }) => {
+  execute: async ({ sock, msg, remoteJid, sender, isOwner, reply }) => {
     try {
       const ctx = getContextInfo(msg);
-      const quotedId = ctx?.stanzaId || quoted?.key?.id || null;
-      let targetMessageObject = null;
+      const quotedMessage = ctx?.quotedMessage;
+      const stanzaId = ctx?.stanzaId;
+      const participant = ctx?.participant;
 
-      // 1. Buscamos el mensaje completo en el store global del bot que se creó en main.js
-      if (quotedId && sock.store && sock.store.messages) {
-        const stored = sock.store.messages.get(quotedId);
-        if (stored) {
-          targetMessageObject = stored;
-        }
-      }
-
-      // 2. Si no está en el store, intentamos usar la cita directa del mensaje
-      if (!targetMessageObject && (quoted?.message || ctx?.quotedMessage)) {
-        targetMessageObject = {
-          key: {
-            remoteJid,
-            fromMe: false,
-            id: quotedId,
-            participant: ctx?.participant || quoted?.key?.participant
-          },
-          message: quoted?.message || ctx?.quotedMessage
-        };
-      }
-
-      if (!targetMessageObject) {
-        return reply('❌ Responde a la foto, video, audio o sticker de *"Ver una sola vez"* con *.ver*.');
+      if (!quotedMessage || !stanzaId) {
+        return reply('❌ Debes responder directamente a la foto, video o audio de *"Ver una sola vez"* con *.ver*.');
       }
 
       // 🎟️ Validar tickets de inventario si no es Owner
@@ -74,19 +63,67 @@ module.exports = {
         }
       }
 
+      // Reconstruimos el objeto del mensaje utilizando la cita directa que llegó en el chat
+      const targetMessage = {
+        key: {
+          remoteJid,
+          fromMe: false,
+          id: stanzaId,
+          participant: participant || remoteJid
+        },
+        message: quotedMessage
+      };
+
+      let mediaBuffer;
+      try {
+        mediaBuffer = await downloadMediaMessage(
+          targetMessage,
+          'buffer',
+          {},
+          { logger: { level: 'silent', child: () => ({ level: 'silent' }) } }
+        );
+      } catch (err) {
+        return reply('⚠️ No se pudo descargar el archivo. Asegúrate de responder al mensaje de Ver Una Sola Vez.');
+      }
+
+      if (!mediaBuffer || !mediaBuffer.length) {
+        return reply('❌ El archivo multimedia está vacío.');
+      }
+
       if (!isOwner) {
         dbInv[invKey].verUses -= 1;
         saveInv(dbInv);
       }
 
-      // 🚀 Reenvío nativo absoluto de Baileys (Reenvía cualquier tipo de archivo o sticker sin alterar nada)
-      await sock.sendMessage(remoteJid, {
-        forward: targetMessageObject
-      }, { quoted: msg });
+      const inner =
+        quotedMessage.viewOnceMessage?.message ||
+        quotedMessage.viewOnceMessageV2?.message ||
+        quotedMessage.viewOnceMessageV2Extension?.message ||
+        quotedMessage.ephemeralMessage?.message?.viewOnceMessage?.message ||
+        quotedMessage.ephemeralMessage?.message?.viewOnceMessageV2?.message ||
+        quotedMessage.ephemeralMessage?.message?.viewOnceMessageV2Extension?.message ||
+        quotedMessage.ephemeralMessage?.message ||
+        quotedMessage;
+
+      const isImage = inner.imageMessage || quotedMessage.imageMessage;
+      const isVideo = inner.videoMessage || quotedMessage.videoMessage;
+      const isAudio = inner.audioMessage || quotedMessage.audioMessage;
+      const caption = isImage?.caption || isVideo?.caption || '';
+      const captionText = caption ? `📝 *Texto:* ${caption}` : '';
+
+      if (isImage) {
+        await sock.sendMessage(remoteJid, { image: mediaBuffer, caption: captionText }, { quoted: msg });
+      } else if (isVideo) {
+        await sock.sendMessage(remoteJid, { video: mediaBuffer, caption: captionText }, { quoted: msg });
+      } else if (isAudio) {
+        await sock.sendMessage(remoteJid, { audio: mediaBuffer, mimetype: isAudio.mimetype || 'audio/ogg; codecs=opus', ptt: true }, { quoted: msg });
+      } else {
+        await sock.sendMessage(remoteJid, { document: mediaBuffer, mimetype: 'application/octet-stream', fileName: 'revelado.bin', caption: captionText }, { quoted: msg });
+      }
 
     } catch (err) {
-      console.log('❌ Error en comando .ver (Reenvío):', err?.message || err);
-      return reply('❌ Ocurrió un error al intentar reenviar el mensaje.');
+      console.log('❌ Error en comando .ver:', err?.message || err);
+      return reply('❌ Ocurrió un error al intentar revelar el archivo.');
     }
   }
 };
