@@ -2,10 +2,15 @@
 
 const fs = require('fs');
 const path = require('path');
-const { downloadMediaMessage } = require('@whiskeysockets/baileys');
+const { downloadContentFromMessage } = require('@whiskeysockets/baileys');
 const { getContextInfo } = require('../lib/utils');
 
 const INV_PATH = path.join(process.cwd(), 'lib', 'inventario.json');
+
+// 🧠 Memoria RAM de alta velocidad para capturar View Once en tiempo real
+const liveViewOnceCache = new Map();
+const lastInChat = new Map();
+const CACHE_TTL = 3 * 60 * 60 * 1000; // 3 horas
 
 function getInv() {
   try { return JSON.parse(fs.readFileSync(INV_PATH, 'utf8')); } catch { return {}; }
@@ -28,39 +33,100 @@ function findUserInvKey(dbInv, senderJid) {
   return clean;
 }
 
+// 🔍 Extractor universal de contenido "Ver una sola vez"
+function extractViewOnceRaw(msgObj = {}) {
+  if (!msgObj) return null;
+
+  const inner =
+    msgObj.viewOnceMessage?.message ||
+    msgObj.viewOnceMessageV2?.message ||
+    msgObj.viewOnceMessageV2Extension?.message ||
+    msgObj.ephemeralMessage?.message?.viewOnceMessage?.message ||
+    msgObj.ephemeralMessage?.message?.viewOnceMessageV2?.message ||
+    msgObj.ephemeralMessage?.message?.viewOnceMessageV2Extension?.message ||
+    msgObj.ephemeralMessage?.message ||
+    msgObj;
+
+  const img = inner.imageMessage || msgObj.imageMessage;
+  const vid = inner.videoMessage || msgObj.videoMessage;
+  const aud = inner.audioMessage || msgObj.audioMessage;
+
+  const isVO = (m) => m && (m.viewOnce || msgObj.viewOnceMessage || msgObj.viewOnceMessageV2 || msgObj.viewOnceMessageV2Extension);
+
+  if (img && isVO(img)) return { type: 'image', media: img, mimetype: img.mimetype || 'image/jpeg', caption: img.caption || '' };
+  if (vid && isVO(vid)) return { type: 'video', media: vid, mimetype: vid.mimetype || 'video/mp4', caption: vid.caption || '' };
+  if (aud && isVO(aud)) return { type: 'audio', media: aud, mimetype: aud.mimetype || 'audio/ogg; codecs=opus', caption: '' };
+
+  return null;
+}
+
+async function downloadBuffer(media, type) {
+  const stream = await downloadContentFromMessage(media, type);
+  const chunks = [];
+  for await (const chunk of stream) chunks.push(chunk);
+  return Buffer.concat(chunks);
+}
+
 module.exports = {
   name: 'ver',
   aliases: ['rvo', 'revelar', 'viewonce'],
   category: 'utilidad & búsqueda',
-  desc: 'Revela y reenvía mensajes de "Ver una sola vez"',
+  desc: 'Revela mensajes de "Ver una sola vez" al instante',
+
+  // 📡 Intercepta el archivo en el milisegundo exacto en que entra al chat (antes de abrirse)
+  onMessage: async ({ msg, remoteJid }) => {
+    try {
+      if (!msg?.message || !msg?.key?.id) return;
+      const extracted = extractViewOnceRaw(msg.message);
+      if (!extracted || !extracted.media) return;
+
+      const now = Date.now();
+      for (const [id, item] of liveViewOnceCache.entries()) {
+        if (now - item.time > CACHE_TTL) liveViewOnceCache.delete(id);
+      }
+
+      // Descargamos el buffer de inmediato a la RAM antes de que el usuario lo abra
+      let buffer = null;
+      try {
+        buffer = await downloadBuffer(extracted.media, extracted.type);
+      } catch {}
+
+      if (buffer && buffer.length > 0) {
+        liveViewOnceCache.set(msg.key.id, {
+          type: extracted.type,
+          mimetype: extracted.mimetype,
+          caption: extracted.caption,
+          buffer,
+          time: now
+        });
+        lastInChat.set(remoteJid, msg.key.id);
+      }
+    } catch {}
+  },
 
   execute: async ({ sock, msg, remoteJid, sender, isOwner, quoted, reply }) => {
     try {
       const ctx = getContextInfo(msg);
       const quotedId = ctx?.stanzaId || quoted?.key?.id || null;
-      let targetMsg = quoted?.message || ctx?.quotedMessage || null;
 
-      // Si no viene en la cita directa, lo buscamos en el store global de mensajes del bot
-      if (!targetMsg && quotedId && sock.store && sock.store.messages) {
-        const stored = sock.store.messages.get(quotedId);
-        if (stored && stored.message) {
-          targetMsg = stored.message;
+      let targetData = null;
+
+      // 1. Buscar en la memoria RAM el archivo capturado en vivo
+      if (quotedId && liveViewOnceCache.has(quotedId)) {
+        targetData = liveViewOnceCache.get(quotedId);
+      }
+
+      // 2. Si no está en RAM pero el usuario puso .ver sin citar nada, usar el último del chat
+      if (!targetData && !quotedId) {
+        const lastId = lastInChat.get(remoteJid);
+        if (lastId && liveViewOnceCache.has(lastId)) {
+          targetData = liveViewOnceCache.get(lastId);
         }
       }
 
-      if (!targetMsg) {
-        return reply('❌ Responde a una foto, video o audio de *"Ver una sola vez"* con *.ver*.');
+      if (!targetData || !targetData.buffer) {
+        return reply('❌ Para revelar una foto/video de *"Ver una sola vez"*, debes responder directamente al mensaje *antes o después de que llegue* (el bot lo intercepta automáticamente al entrar al chat).');
       }
-
-      // Reconstruimos un objeto de mensaje válido para que Baileys lo descargue sin restricciones
-      const fullMsgObject = {
-        key: {
-          remoteJid,
-          id: quotedId,
-          participant: ctx?.participant || quoted?.key?.participant
-        },
-        message: targetMsg
-      };
 
       // 🎟️ Validar tickets de inventario si no es Owner
       const dbInv = getInv();
@@ -72,54 +138,20 @@ module.exports = {
         }
       }
 
-      // 🚀 Descarga nativa garantizada con Baileys
-      let mediaBuffer;
-      try {
-        mediaBuffer = await downloadMediaMessage(
-          fullMsgObject,
-          'buffer',
-          {},
-          { logger: { level: 'silent', child: () => ({ level: 'silent' }) } }
-        );
-      } catch (err) {
-        return reply('⚠️ No se pudo descargar el archivo. Es posible que el mensaje ya haya expirado en los servidores de WhatsApp.');
-      }
-
-      if (!mediaBuffer || !mediaBuffer.length) {
-        return reply('❌ El archivo multimedia está vacío.');
-      }
-
       if (!isOwner) {
         dbInv[invKey].verUses -= 1;
         saveInv(dbInv);
       }
 
-      // Detectar el tipo de archivo para enviarlo correctamente
-      const inner =
-        targetMsg.viewOnceMessage?.message ||
-        targetMsg.viewOnceMessageV2?.message ||
-        targetMsg.viewOnceMessageV2Extension?.message ||
-        targetMsg.ephemeralMessage?.message?.viewOnceMessage?.message ||
-        targetMsg.ephemeralMessage?.message?.viewOnceMessageV2?.message ||
-        targetMsg.ephemeralMessage?.message?.viewOnceMessageV2Extension?.message ||
-        targetMsg.ephemeralMessage?.message ||
-        targetMsg;
+      const captionText = targetData.caption ? `📝 *Texto:* ${targetData.caption}` : '';
 
-      const isImage = inner.imageMessage || targetMsg.imageMessage;
-      const isVideo = inner.videoMessage || targetMsg.videoMessage;
-      const isAudio = inner.audioMessage || targetMsg.audioMessage;
-      const caption = isImage?.caption || isVideo?.caption || '';
-      const captionText = caption ? `📝 *Texto:* ${caption}` : '';
-
-      if (isImage) {
-        await sock.sendMessage(remoteJid, { image: mediaBuffer, caption: captionText }, { quoted: msg });
-      } else if (isVideo) {
-        await sock.sendMessage(remoteJid, { video: mediaBuffer, caption: captionText }, { quoted: msg });
-      } else if (isAudio) {
-        await sock.sendMessage(remoteJid, { audio: mediaBuffer, mimetype: isAudio.mimetype || 'audio/ogg; codecs=opus', ptt: true }, { quoted: msg });
-      } else {
-        // Fallback genérico si detecta cualquier otro archivo
-        await sock.sendMessage(remoteJid, { document: mediaBuffer, mimetype: 'application/octet-stream', fileName: 'archivo_revelado.bin', caption: captionText }, { quoted: msg });
+      // 🚀 Enviar el archivo recuperado al chat
+      if (targetData.type === 'image') {
+        await sock.sendMessage(remoteJid, { image: targetData.buffer, caption: captionText }, { quoted: msg });
+      } else if (targetData.type === 'video') {
+        await sock.sendMessage(remoteJid, { video: targetData.buffer, caption: captionText }, { quoted: msg });
+      } else if (targetData.type === 'audio') {
+        await sock.sendMessage(remoteJid, { audio: targetData.buffer, mimetype: targetData.mimetype, ptt: true }, { quoted: msg });
       }
 
     } catch (err) {
