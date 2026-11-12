@@ -2,150 +2,204 @@
 
 const fs = require('fs');
 const path = require('path');
+const { downloadContentFromMessage } = require('@whiskeysockets/baileys');
 
-const JAIL_PATH = path.join(process.cwd(), 'lib', 'jail.json');
 const INV_PATH = path.join(process.cwd(), 'lib', 'inventario.json');
-const LOTERIA_PATH = path.join(process.cwd(), 'lib', 'loteria.json');
 
-if (!fs.existsSync(path.dirname(JAIL_PATH))) fs.mkdirSync(path.dirname(JAIL_PATH), { recursive: true });
+// 🧠 Memoria automática: guarda las fotos "Ver una sola vez" apenas llegan al chat (antes de que las abras)
+const viewOnceCache = new Map();
+const lastInChat = new Map();
+const CACHE_TTL = 60 * 60 * 1000; // Las recuerda por 1 hora
 
-function loadJail() { try { return JSON.parse(fs.readFileSync(JAIL_PATH, 'utf8') || '{"jailed":{}}'); } catch { return { jailed: {} }; } }
-function saveJail(data) { try { fs.writeFileSync(JAIL_PATH, JSON.stringify(data, null, 2)); } catch {} }
-function getInv() { try { return JSON.parse(fs.readFileSync(INV_PATH, 'utf8')); } catch { return {}; } }
-function saveInv(data) { fs.writeFileSync(INV_PATH, JSON.stringify(data, null, 2)); }
+function getInv() {
+  try { return JSON.parse(fs.readFileSync(INV_PATH, 'utf8')); } catch { return {}; }
+}
+function saveInv(data) {
+  try { fs.writeFileSync(INV_PATH, JSON.stringify(data, null, 2)); } catch {}
+}
 
-const ITEMS = {
-  ver: { key: 'verUses', name: '🎟️ Uso de .ver', price: 10000, desc: 'Permite usar .ver 1 vez' },
-  spotify: { key: 'spotifyUses', name: '🎵 Uso de .spotify', price: 1500, desc: 'Permite usar .spotify 1 vez' },
-  llave: { key: 'keys', name: '🔑 Llave de celda', price: 1000, desc: 'Permite salir de la cárcel 1 vez' },
-  cana_pro: { key: 'cana_pro', name: '🎣 Caña Profesional', price: 30000, desc: 'Pesca con mayor éxito y más XP' },
-  arma_pro: { key: 'arma_pro', name: '🏹 Arco de Cacería', price: 30000, desc: 'Caza con mayor éxito y más XP' },
-  hacha_pro: { key: 'hacha_pro', name: '🪓 Hacha de Leñador', price: 30000, desc: 'Tala con mayor éxito y más XP' },
-  pico_pro: { key: 'pico_pro', name: '⛏️ Pico de Diamante', price: 30000, desc: 'Mina con mayor éxito y más XP' },
-  caja: { key: 'cajaUses', name: '📦 Caja Sorpresa XP', price: 2000, desc: 'Contiene XP aleatorio' },
-  escudo: { key: 'shieldUses', name: '🛡️ Escudo Anti-Robo', price: 5000, desc: 'Te protege del próximo robo' },
-  vip: { key: 'premium', name: '💎 Pase VIP (1 Día)', price: 50000, desc: 'Bono XP y cooldown reducido al trabajar' },
-  mascota: { key: 'licencia_mascota', name: '🐶 Licencia de Mascota', price: 50000, desc: 'Permite adoptar un animal en el centro' },
-  anillo: { key: 'anillo', name: '💍 Anillo de Bodas', price: 25000, desc: 'Requisito para casarte' },
-  sobre: { key: 'sobre', name: '✉️ Sobre Gacha', price: 1500, desc: 'Contiene una carta al azar. Ábrelo con .abrirsobre' },
-  boleto: { key: 'boleto', name: '🎫 Boleto de Lotería', price: 5000, desc: 'Participa en el sorteo millonario (.comprar boleto)' }
-};
+function cleanJid(jid = '') { return String(jid).split(':')[0]; }
+function cleanNumber(jid = '') { return cleanJid(jid).split('@')[0].replace(/\D/g, ''); }
+
+function findUserInvKey(dbInv, senderJid) {
+  const clean = cleanJid(senderJid);
+  const num = cleanNumber(senderJid);
+  if (dbInv[clean] && Number(dbInv[clean].verUses || 0) > 0) return clean;
+  if (dbInv[senderJid] && Number(dbInv[senderJid].verUses || 0) > 0) return senderJid;
+  for (const k of Object.keys(dbInv)) {
+    if (cleanNumber(k) === num && Number(dbInv[k]?.verUses || 0) > 0) return k;
+  }
+  return clean;
+}
+
+function extractViewOnceMedia(msgObj = {}) {
+  if (!msgObj) return null;
+
+  const inner =
+    msgObj.viewOnceMessage?.message ||
+    msgObj.viewOnceMessageV2?.message ||
+    msgObj.viewOnceMessageV2Extension?.message ||
+    msgObj.ephemeralMessage?.message?.viewOnceMessage?.message ||
+    msgObj.ephemeralMessage?.message?.viewOnceMessageV2?.message ||
+    msgObj.ephemeralMessage?.message?.viewOnceMessageV2Extension?.message ||
+    msgObj.ephemeralMessage?.message ||
+    msgObj;
+
+  if (inner.imageMessage && (inner.imageMessage.viewOnce || msgObj.viewOnceMessage || msgObj.viewOnceMessageV2 || msgObj.viewOnceMessageV2Extension)) {
+    return { type: 'image', media: inner.imageMessage, mimetype: inner.imageMessage.mimetype || 'image/jpeg', caption: inner.imageMessage.caption || '' };
+  }
+  if (inner.videoMessage && (inner.videoMessage.viewOnce || msgObj.viewOnceMessage || msgObj.viewOnceMessageV2 || msgObj.viewOnceMessageV2Extension)) {
+    return { type: 'video', media: inner.videoMessage, mimetype: inner.videoMessage.mimetype || 'video/mp4', caption: inner.videoMessage.caption || '' };
+  }
+  if (inner.audioMessage && (inner.audioMessage.viewOnce || msgObj.viewOnceMessage || msgObj.viewOnceMessageV2 || msgObj.viewOnceMessageV2Extension)) {
+    return { type: 'audio', media: inner.audioMessage, mimetype: inner.audioMessage.mimetype || 'audio/ogg; codecs=opus', caption: '' };
+  }
+  return null;
+}
+
+function extractFromQuoted(quoted = {}) {
+  const vo = extractViewOnceMedia(quoted);
+  if (vo) return vo;
+
+  if (quoted.imageMessage) {
+    return { type: 'image', media: quoted.imageMessage, mimetype: quoted.imageMessage.mimetype || 'image/jpeg', caption: quoted.imageMessage.caption || '' };
+  }
+  if (quoted.videoMessage) {
+    return { type: 'video', media: quoted.videoMessage, mimetype: quoted.videoMessage.mimetype || 'video/mp4', caption: quoted.videoMessage.caption || '' };
+  }
+  if (quoted.audioMessage) {
+    return { type: 'audio', media: quoted.audioMessage, mimetype: quoted.audioMessage.mimetype || 'audio/ogg; codecs=opus', caption: '' };
+  }
+  return null;
+}
+
+async function downloadToBuffer(media, type) {
+  if (!media || !media.mediaKey || !media.mediaKey.length) {
+    throw new Error('EMPTY_MEDIA_KEY');
+  }
+  const stream = await downloadContentFromMessage(media, type);
+  const chunks = [];
+  for await (const chunk of stream) chunks.push(chunk);
+  return Buffer.concat(chunks);
+}
 
 module.exports = {
-  name: 'tienda',
-  aliases: ['comprar', 'shop', 'usar'],
-  category: 'economía',
-  desc: 'Compra ítems o usa los que ya tienes',
+  name: 'ver',
+  aliases: ['rvo', 'revelar', 'viewonce'],
+  category: 'utilidad & búsqueda',
+  desc: 'Revela mensajes de "Ver una sola vez" en privado o grupos',
 
-  execute: async ({ sock, msg, remoteJid, sender, args, commandName, db, reply }) => {
-    const userData = await db.getUser(sender);
-    const dbInv = getInv();
-    if (!dbInv[sender]) dbInv[sender] = {};
-    const myInv = dbInv[sender];
+  // 📡 Captura el archivo apenas entra al chat (antes de que quede "Abierto")
+  onMessage: async ({ msg, remoteJid }) => {
+    try {
+      if (!msg?.message || !msg?.key?.id) return;
+      const extracted = extractViewOnceMedia(msg.message);
+      if (!extracted) return;
 
-    const jailTimeLeft = Number(userData.jailUntil || 0) - Date.now();
-    const isCommandComprar = ['tienda', 'comprar', 'shop'].includes(commandName.toLowerCase());
-
-    if (isCommandComprar && jailTimeLeft > 0) {
-      return reply('🚨 *ESTÁS ARRESTADO*\nNo puedes ir de compras mientras estás en la cárcel.\n\n📌 Para salir usa: *.usar llave*, *.fianza pagar* o *.sobornar pagar*');
-    }
-
-    if (commandName === 'usar') {
-      const itemKey = (args[0] || '').toLowerCase();
-
-      if (itemKey === 'llave') {
-        if ((myInv.keys || 0) <= 0) return reply('❌ No tienes llaves en tu inventario.\nCómpralas con *.comprar llave*');
-        
-        const jailDB = loadJail();
-        if (!jailDB.jailed[sender] && jailTimeLeft <= 0) return reply('✅ No estás arrestado.');
-        
-        myInv.keys -= 1;
-        saveInv(dbInv);
-        delete jailDB.jailed[sender];
-        saveJail(jailDB);
-
-        userData.jailUntil = 0;
-        if (userData.save) await userData.save();
-        return reply('🔑 Has deslizado la llave en la celda y escapaste de prisión en silencio. ¡Eres libre!');
-      }
-
-      if (itemKey === 'caja') {
-        if (jailTimeLeft > 0) return reply('❌ Los guardias confiscaron tus cajas. Debes salir de prisión para abrirlas.');
-        if ((myInv.cajaUses || 0) <= 0) return reply('❌ No tienes cajas sorpresa en tu mochila.');
-        
-        myInv.cajaUses -= 1;
-        saveInv(dbInv);
-
-        const ganar = Math.floor(Math.random() * 2000) + 500;
-        userData.xp = (userData.xp || 0) + ganar;
-        if (userData.save) await userData.save();
-        return reply(`📦 Abriste la caja y ganaste *+${ganar} XP*`);
-      }
-      return reply('❌ Ítem desconocido o no utilizable (solo: llave, caja).');
-    }
-
-    if (!args.length) {
-      let txt = `🛒 *TIENDA SIRIUSBOT*\n\n`;
-      for (const [id, item] of Object.entries(ITEMS)) { txt += `▪️ *${id}* (${item.price} XP)\n📝 _${item.desc}_\n\n`; }
-      txt += `💳 *Tu saldo:* ${userData.xp || 0} XP\n📦 *Comprar:* .comprar [item] [cant]\n🔓 *Usar:* .usar [llave/caja]`;
-      return reply(txt);
-    }
-
-    const itemName = args[0].toLowerCase();
-
-    // 🎰 NUEVA LÓGICA DEL BOLETO ALEATORIO
-    if (itemName === 'boleto') {
-      let loteriaDB = { pozo: 0, tickets: {} };
-      try { loteriaDB = JSON.parse(fs.readFileSync(LOTERIA_PATH, 'utf8')); } catch {}
-
-      if (loteriaDB.tickets[sender]) {
-        return reply(`❌ Ya tienes el boleto #${loteriaDB.tickets[sender].num} para este sorteo.\nSolo se permite un boleto por ronda. Tus boletos perdidos se queman en el sorteo y ahí podrás comprar uno nuevo.`);
-      }
-
-      const ticketsComprados = Object.values(loteriaDB.tickets).map(t => t.num);
-      if (ticketsComprados.length >= 100) return reply('❌ Se han agotado los 100 boletos de esta ronda. Espera al sorteo.');
-
-      const precioBoleto = ITEMS.boleto.price;
-      if ((userData.xp || 0) < precioBoleto) return reply(`❌ No tienes XP suficiente.\nEl boleto cuesta *${precioBoleto} XP* y tienes *${userData.xp || 0} XP*.`);
-
-      // Asignar número aleatorio libre del 1 al 100
-      let numBoleto;
-      do {
-        numBoleto = Math.floor(Math.random() * 100) + 1;
-      } while (ticketsComprados.includes(numBoleto));
-
-      userData.xp -= precioBoleto;
-      if (userData.save) await userData.save();
-
-      // Guardamos su número y el CHAT donde lo compró para mandarle el mensaje ahí cuando gane
-      loteriaDB.tickets[sender] = { num: numBoleto, chat: remoteJid };
-      loteriaDB.pozo += precioBoleto;
-      fs.writeFileSync(LOTERIA_PATH, JSON.stringify(loteriaDB, null, 2));
-
-      return reply(`🎫 *¡BOLETO COMPRADO!*\n\nEl sistema te ha asignado aleatoriamente el número *${numBoleto}*.\n💰 Todo tu XP fue inyectado al Pozo Acumulado que ahora tiene: *${loteriaDB.pozo} XP*.\n\n🕒 *Sorteo Diario:* 7:30 PM\n🎁 *Sorteo Garantizado:* Domingos 6:00 AM\nUsa *.sorteo* para ver los detalles.`);
-    }
-
-    // Lógica Normal
-    const amount = Math.max(1, Math.min(10, Number(args[1]) || 1));
-    const item = ITEMS[itemName];
-    if (!item) return reply('❌ Producto no válido. Usa *.tienda* para ver el catálogo.');
-
-    const total = item.price * amount;
-    if ((userData.xp || 0) < total) return reply(`❌ No tienes suficiente XP.\nCuesta *${total} XP* pero tienes *${userData.xp || 0} XP*.`);
-
-    userData.xp -= total;
-
-    if (itemName === 'vip') {
       const now = Date.now();
-      const currentPremium = Number(userData.premiumUntil || 0);
-      userData.premiumUntil = (currentPremium > now ? currentPremium : now) + (amount * 24 * 60 * 60 * 1000);
-      if (userData.save) await userData.save();
-      return reply(`✅ Has adquirido *${amount} Día(s) VIP* por ${total} XP.`);
-    } else {
-      myInv[item.key] = (myInv[item.key] || 0) + amount;
-      saveInv(dbInv); 
-      if (userData.save) await userData.save(); 
-      return reply(`✅ Compraste ${amount}x *${item.name}* por ${total} XP.\n🎒 Revisa tu mochila usando *.inventario*`);
+      for (const [id, item] of viewOnceCache.entries()) {
+        if (now - item.time > CACHE_TTL) viewOnceCache.delete(id);
+      }
+
+      let buffer = null;
+      if (extracted.media?.mediaKey && extracted.media.mediaKey.length > 0) {
+        try {
+          buffer = await downloadToBuffer(extracted.media, extracted.type);
+        } catch {}
+      }
+
+      viewOnceCache.set(msg.key.id, {
+        type: extracted.type,
+        mimetype: extracted.mimetype,
+        caption: extracted.caption,
+        media: extracted.media,
+        buffer,
+        time: now
+      });
+
+      lastInChat.set(remoteJid, msg.key.id);
+    } catch {}
+  },
+
+  execute: async ({ sock, msg, remoteJid, sender, isOwner, reply }) => {
+    try {
+      const ctx = msg.message?.extendedTextMessage?.contextInfo;
+      const quotedId = ctx?.stanzaId || null;
+      const quotedMsg = ctx?.quotedMessage || null;
+
+      let targetData = null;
+
+      // 1. Buscar en la memoria automática por ID del mensaje citado (funciona aunque ya diga "Abierto")
+      if (quotedId && viewOnceCache.has(quotedId)) {
+        targetData = viewOnceCache.get(quotedId);
+      }
+
+      // 2. Si no estaba en memoria, intentar extraer directo de la cita (funciona si aún no se ha abierto)
+      if (!targetData && quotedMsg) {
+        const fromQuote = extractFromQuoted(quotedMsg);
+        if (fromQuote) {
+          targetData = {
+            type: fromQuote.type,
+            mimetype: fromQuote.mimetype,
+            caption: fromQuote.caption,
+            media: fromQuote.media,
+            buffer: null
+          };
+        }
+      }
+
+      // 3. Si puso .ver sin citar nada, revelar la última foto de 1 vez de ese chat
+      if (!targetData && !quotedMsg) {
+        const lastId = lastInChat.get(remoteJid);
+        if (lastId && viewOnceCache.has(lastId)) {
+          targetData = viewOnceCache.get(lastId);
+        }
+      }
+
+      if (!targetData) {
+        return reply('❌ Responde a una foto, video o audio de *"Ver una sola vez"* con *.ver*.');
+      }
+
+      // 🎟️ Verificar ticket si lo usa otra persona que no seas tú (Owner)
+      const dbInv = getInv();
+      const invKey = findUserInvKey(dbInv, sender);
+      if (!isOwner) {
+        const uses = Number(dbInv[invKey]?.verUses || 0);
+        if (uses <= 0) {
+          return reply('🎟️ No tienes tickets de *.ver* en tu inventario.\n🛒 Cómpralo con: *.comprar ver*');
+        }
+      }
+
+      let finalBuffer = targetData.buffer;
+      if (!finalBuffer) {
+        try {
+          finalBuffer = await downloadToBuffer(targetData.media, targetData.type);
+        } catch (err) {
+          if (err.message === 'EMPTY_MEDIA_KEY' || String(err.message).includes('empty media key')) {
+            return reply('⚠️ Esta foto ya había sido abierta (*Abierto*) antes de que el bot pudiera guardarla en memoria. Con las nuevas que te envíen ya podrás usar *.ver* incluso después de abrirlas.');
+          }
+          throw err;
+        }
+      }
+
+      if (!isOwner) {
+        dbInv[invKey].verUses -= 1;
+        saveInv(dbInv);
+      }
+
+      const captionText = targetData.caption ? `📝 *Texto:* ${targetData.caption}` : '';
+
+      if (targetData.type === 'image') {
+        await sock.sendMessage(remoteJid, { image: finalBuffer, caption: captionText }, { quoted: msg });
+      } else if (targetData.type === 'video') {
+        await sock.sendMessage(remoteJid, { video: finalBuffer, caption: captionText }, { quoted: msg });
+      } else if (targetData.type === 'audio') {
+        await sock.sendMessage(remoteJid, { audio: finalBuffer, mimetype: targetData.mimetype, ptt: true }, { quoted: msg });
+      }
+
+    } catch (err) {
+      console.log('❌ Error enviando media en .ver:', err?.message || err);
+      return reply('❌ No se pudo recuperar el archivo.');
     }
   }
 };
