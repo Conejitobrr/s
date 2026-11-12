@@ -200,13 +200,15 @@ async function startBot(opts = {}) {
         continue;
       }
 
-      // Si llega cifrado en el 1er intento, NO lo metemos a processedMessages para que la 2da lectura pase limpia
       const unwrapped = unwrapMessage(msg.message);
       if (!msg.message || !unwrapped || Object.keys(unwrapped).length === 0) {
         continue;
       }
 
-      if (unwrapped.protocolMessage && !unwrapped.protocolMessage.editedMessage) {
+      // ✅ Permite que pasen los mensajes normales, los editados y los eliminados (para el Antidelete)
+      const proto = unwrapped.protocolMessage || msg.message?.protocolMessage;
+      const isDeleteEvent = proto && (proto.type === 0 || proto.type === 'REVOKE' || !!proto.key?.id);
+      if (proto && !proto.editedMessage && !isDeleteEvent) {
         continue;
       }
 
@@ -222,7 +224,7 @@ async function startBot(opts = {}) {
 
     if (config.readMessages) {
       const keysToRead = validBatch
-        .filter(m => m.key && !m.key.fromMe && m.message)
+        .filter(m => m.key && !m.key.fromMe && m.message && !m.message.protocolMessage)
         .map(m => m.key);
       if (keysToRead.length > 0) {
         sock.readMessages(keysToRead).catch(() => {});
