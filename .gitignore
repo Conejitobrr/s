@@ -1,0 +1,11 @@
+node_modules/
+.env
+.env.local
+session/
+lib/database.json
+lib/shop_inventory.json
+lib/jail.json
+*.tmp
+.DS_Store
+lib/custom_audios.json
+media/custom_*
