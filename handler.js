@@ -2,13 +2,13 @@
 
 const fs = require('fs');
 const path = require('path');
+const os = require('os');
 const chalk = require('chalk');
 const config = require('./config');
 const db = require('./lib/database');
 const {
   getBody,
   normalizeJid,
-  detectPrefix,
   cleanNumber,
   getReadableType,
   getContextInfo,
@@ -38,6 +38,29 @@ function getTime() {
     second: '2-digit',
     hour12: true
   });
+}
+
+// Detector de prefijo blindado (soporta '.', '!', '#', '/' siempre, aunque el .env tenga comillas)
+function parseCommandPrefix(text = '') {
+  if (!text || typeof text !== 'string') return null;
+  const trimmed = text.trim();
+  const validPrefixes = ['.', '!', '#', '/'];
+
+  if (config.prefix) {
+    const extra = Array.isArray(config.prefix) ? config.prefix : [String(config.prefix)];
+    for (const p of extra) {
+      const cleanP = String(p).replace(/['"\[\]\s]/g, '');
+      if (cleanP && !validPrefixes.includes(cleanP)) validPrefixes.push(cleanP);
+    }
+  }
+
+  const matched = validPrefixes.find(p => trimmed.startsWith(p));
+  if (!matched) return null;
+
+  return {
+    prefix: matched,
+    body: trimmed.slice(matched.length).trim()
+  };
 }
 
 async function checkBannedUser(sock, remoteJid, sender, msg, isOwner) {
@@ -93,6 +116,20 @@ const commands = new Map();
 const aliases = new Map();
 const messageListeners = [];
 const groupListeners = [];
+
+// Lee archivos .js incluso si están dentro de subcarpetas en ./plugins
+function getAllPluginFiles(dirPath, arrayOfFiles = []) {
+  const files = fs.readdirSync(dirPath);
+  for (const file of files) {
+    const fullPath = path.join(dirPath, file);
+    if (fs.statSync(fullPath).isDirectory()) {
+      getAllPluginFiles(fullPath, arrayOfFiles);
+    } else if (file.endsWith('.js')) {
+      arrayOfFiles.push(fullPath);
+    }
+  }
+  return arrayOfFiles;
+}
 
 async function dispatchGroupUpdate(sock, id, participants, action) {
   if (!id || !Array.isArray(participants) || !participants.length) return;
@@ -179,13 +216,31 @@ function loadPlugins() {
   messageListeners.length = 0;
   groupListeners.length = 0;
 
-  const files = fs.readdirSync(PLUGINS_DIR).filter(file => file.endsWith('.js'));
+  // ⚡ Comando base integrado (.ping / .estado / .status) por si no existe en ./plugins
+  const builtinPing = {
+    name: 'ping',
+    aliases: ['p', 'estado', 'status'],
+    execute: async ({ reply }) => {
+      const usedRam = (process.memoryUsage().rss / 1024 / 1024).toFixed(1);
+      const totalRam = (os.totalmem() / 1024 / 1024 / 1024).toFixed(1);
+      await reply(
+        `🚀 *${config.botName} v${config.botVersion}*\n\n` +
+        `⚡ *Velocidad:* Instantánea\n` +
+        `🧩 *Comandos cargados:* ${commands.size}\n` +
+        `🧠 *RAM en uso:* ${usedRam} MB / ${totalRam} GB\n` +
+        `📡 *Estado:* 100% Operativo`
+      );
+    }
+  };
+  commands.set('ping', builtinPing);
+  for (const a of builtinPing.aliases) aliases.set(a, 'ping');
+
+  const files = getAllPluginFiles(PLUGINS_DIR);
   let cmdCount = 0;
   let listenerCount = 0;
 
-  for (const file of files) {
+  for (const filepath of files) {
     try {
-      const filepath = path.join(PLUGINS_DIR, file);
       delete require.cache[require.resolve(filepath)];
       const rawPlugin = require(filepath);
 
@@ -197,7 +252,7 @@ function loadPlugins() {
       const cmdNameRaw = rawPlugin.name || (Array.isArray(rawPlugin.command) ? rawPlugin.command[0] : rawPlugin.command);
 
       if (cmdNameRaw && typeof executeFn === 'function') {
-        const cmdName = String(cmdNameRaw).toLowerCase();
+        const cmdName = String(cmdNameRaw).toLowerCase().trim();
         const normalizedPlugin = typeof rawPlugin === 'function'
           ? { name: cmdName, execute: executeFn }
           : { ...rawPlugin, name: cmdName, execute: executeFn };
@@ -211,7 +266,7 @@ function loadPlugins() {
         ];
 
         for (const alias of pluginAliases) {
-          if (typeof alias === 'string') aliases.set(alias.toLowerCase(), cmdName);
+          if (typeof alias === 'string') aliases.set(alias.toLowerCase().trim(), cmdName);
         }
         cmdCount++;
       }
@@ -228,10 +283,10 @@ function loadPlugins() {
         groupListeners.push(rawPlugin);
       }
     } catch (err) {
-      console.log(chalk.bgRed.white(' ❌ ERROR PLUGIN '), chalk.red(`Fallo en ${file}: ${err?.message}`));
+      console.log(chalk.bgRed.white(' ❌ ERROR PLUGIN '), chalk.red(`Fallo en ${path.basename(filepath)}: ${err?.message}`));
     }
   }
-  console.log(chalk.bgGreen.black('\n ♻️ PLUGINS LISTOS '), chalk.green(`${cmdCount} comandos y ${listenerCount} detectores activos.\n`));
+  console.log(chalk.bgGreen.black('\n ♻️ PLUGINS LISTOS '), chalk.green(`${cmdCount} plugins en carpeta (+ comandos base) y ${listenerCount} detectores activos.\n`));
 }
 
 loadPlugins();
@@ -295,7 +350,6 @@ async function messageHandler(sock, msg, store = {}) {
       }
     }
 
-    // Impresión inmediata en consola para que ningún mensaje se pierda jamás
     if (config.debug) {
       const msgType = getReadableType(msg);
       const adminStatus = isAdmin ? chalk.green('Sí') : chalk.red('No');
@@ -379,7 +433,7 @@ async function messageHandler(sock, msg, store = {}) {
 
     if (!body) return;
 
-    const parsed = detectPrefix(body, config.prefix);
+    const parsed = parseCommandPrefix(body);
     if (!parsed) return;
 
     const args = parsed.body.trim().split(/\s+/).filter(Boolean);
@@ -389,7 +443,12 @@ async function messageHandler(sock, msg, store = {}) {
     const cmdKey = aliases.has(rawCommand) ? aliases.get(rawCommand) : rawCommand;
     const plugin = commands.get(cmdKey);
 
-    if (!plugin) return;
+    if (!plugin) {
+      if (config.debug) {
+        console.log(chalk.yellow(`⚠️ Comando [${parsed.prefix}${rawCommand}] no existe en ./plugins (Comandos activos: ${commands.size})\n`));
+      }
+      return;
+    }
 
     if (userData && !isOwner) {
       const jailTimeLeft = Number(userData.jailUntil || 0) - Date.now();
