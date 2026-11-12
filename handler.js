@@ -40,7 +40,6 @@ function getTime() {
   });
 }
 
-// Detector de prefijo blindado (soporta '.', '!', '#', '/' siempre, aunque el .env tenga comillas)
 function parseCommandPrefix(text = '') {
   if (!text || typeof text !== 'string') return null;
   const trimmed = text.trim();
@@ -117,7 +116,6 @@ const aliases = new Map();
 const messageListeners = [];
 const groupListeners = [];
 
-// Lee archivos .js incluso si están dentro de subcarpetas en ./plugins
 function getAllPluginFiles(dirPath, arrayOfFiles = []) {
   const files = fs.readdirSync(dirPath);
   for (const file of files) {
@@ -216,7 +214,6 @@ function loadPlugins() {
   messageListeners.length = 0;
   groupListeners.length = 0;
 
-  // ⚡ Comando base integrado (.ping / .estado / .status) por si no existe en ./plugins
   const builtinPing = {
     name: 'ping',
     aliases: ['p', 'estado', 'status'],
@@ -425,9 +422,15 @@ async function messageHandler(sock, msg, store = {}) {
       reply: replyFn
     };
 
+    // 🔥 CORRECCIÓN UNIVERSAL: Ejecuta los listeners pasivos (Ver una sola vez, antidelete, audios, etc.)
+    // en TODOS los chats (Grupos, Privados y contigo mismo) sin restricciones de groupData.
     if (!fromGroup || (groupData && groupData.bot !== false) || isOwner) {
       await Promise.allSettled(
-        messageListeners.map(listener => listener.onMessage(baseCtx))
+        messageListeners.map(listener => {
+          if (typeof listener.onMessage === 'function') {
+            return listener.onMessage(baseCtx);
+          }
+        })
       );
     }
 
