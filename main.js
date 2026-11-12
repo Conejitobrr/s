@@ -206,7 +206,7 @@ async function startBot(opts = {}) {
         continue;
       }
 
-      if (unwrapped.protocolMessage && !unwrapped.protocolMessage.editedMessage) {
+      if (unwrapped.protocolMessage && !unwrapped.protocolMessage.editedMessage && unwrapped.protocolMessage.type !== 0 && !unwrapped.protocolMessage.key)
         continue;
       }
 
