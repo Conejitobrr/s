@@ -2,6 +2,7 @@
 
 const fs = require('fs');
 const path = require('path');
+const { downloadContentFromMessage } = require('@whiskeysockets/baileys');
 const { getContextInfo } = require('../lib/utils');
 
 const INV_PATH = path.join(process.cwd(), 'lib', 'inventario.json');
@@ -27,11 +28,55 @@ function findUserInvKey(dbInv, senderJid) {
   return clean;
 }
 
+// 🔍 Extractor robusto de la estructura interna del mensaje de Ver una sola vez
+function extractViewOncePayload(quotedMsg = {}) {
+  if (!quotedMsg) return null;
+
+  const inner =
+    quotedMsg.viewOnceMessage?.message ||
+    quotedMsg.viewOnceMessageV2?.message ||
+    quotedMsg.viewOnceMessageV2Extension?.message ||
+    quotedMsg.ephemeralMessage?.message?.viewOnceMessage?.message ||
+    quotedMsg.ephemeralMessage?.message?.viewOnceMessageV2?.message ||
+    quotedMsg.ephemeralMessage?.message?.viewOnceMessageV2Extension?.message ||
+    quotedMsg.ephemeralMessage?.message ||
+    quotedMsg;
+
+  const img = inner.imageMessage || quotedMsg.imageMessage;
+  const vid = inner.videoMessage || quotedMsg.videoMessage;
+  const aud = inner.audioMessage || quotedMsg.audioMessage;
+
+  if (img) return { type: 'image', media: img, mimetype: img.mimetype || 'image/jpeg', caption: img.caption || '' };
+  if (vid) return { type: 'video', media: vid, mimetype: vid.mimetype || 'video/mp4', caption: vid.caption || '' };
+  if (aud) return { type: 'audio', media: aud, mimetype: aud.mimetype || 'audio/ogg; codecs=opus', caption: '' };
+
+  return null;
+}
+
+// ⚡ Descarga segura del buffer con reintentos
+async function downloadToBuffer(media, type) {
+  if (!media) throw new Error('NO_MEDIA');
+  let lastErr = null;
+  for (let i = 1; i <= 3; i++) {
+    try {
+      const stream = await downloadContentFromMessage(media, type);
+      const chunks = [];
+      for await (const chunk of stream) chunks.push(chunk);
+      const buf = Buffer.concat(chunks);
+      if (buf && buf.length > 0) return buf;
+    } catch (e) {
+      lastErr = e;
+      await new Promise(r => setTimeout(r, 600 * i));
+    }
+  }
+  throw lastErr || new Error('DOWNLOAD_FAILED');
+}
+
 module.exports = {
   name: 'ver',
   aliases: ['rvo', 'revelar', 'viewonce'],
   category: 'utilidad & búsqueda',
-  desc: 'Reenvía y revela mensajes de "Ver una sola vez" al instante',
+  desc: 'Revela y reenvía mensajes de "Ver una sola vez"',
 
   execute: async ({ sock, msg, remoteJid, sender, isOwner, quoted, reply }) => {
     try {
@@ -39,7 +84,6 @@ module.exports = {
       const quotedId = ctx?.stanzaId || quoted?.key?.id || null;
       let quotedMsg = ctx?.quotedMessage || quoted?.message || null;
 
-      // Si no citó nada pero hay store global, intentamos buscar el mensaje citado en el historial reciente
       if (!quotedMsg && quotedId && sock.store && sock.store.messages) {
         const storedMsg = sock.store.messages.get(quotedId);
         if (storedMsg && storedMsg.message) {
@@ -49,6 +93,11 @@ module.exports = {
 
       if (!quotedMsg) {
         return reply('❌ Responde a una foto, video o audio de *"Ver una sola vez"* con *.ver*.');
+      }
+
+      const payload = extractViewOncePayload(quotedMsg);
+      if (!payload) {
+        return reply('❌ El mensaje citado no contiene contenido multimedia.');
       }
 
       // 🎟️ Validar tickets de inventario si no es Owner
@@ -61,22 +110,15 @@ module.exports = {
         }
       }
 
-      // 🔄 Extraer el contenido interno del View Once para re-enviarlo como normal
-      const viewOnceInner =
-        quotedMsg.viewOnceMessage?.message ||
-        quotedMsg.viewOnceMessageV2?.message ||
-        quotedMsg.viewOnceMessageV2Extension?.message ||
-        quotedMsg.ephemeralMessage?.message?.viewOnceMessage?.message ||
-        quotedMsg.ephemeralMessage?.message?.viewOnceMessageV2?.message ||
-        quotedMsg.ephemeralMessage?.message?.viewOnceMessageV2Extension?.message ||
-        quotedMsg.ephemeralMessage?.message ||
-        quotedMsg;
+      let buffer;
+      try {
+        buffer = await downloadToBuffer(payload.media, payload.type);
+      } catch {
+        return reply('⚠️ No se pudo descargar el archivo. Es posible que el mensaje ya haya expirado en el servidor.');
+      }
 
-      const mediaPayload = viewOnceInner.imageMessage || viewOnceInner.videoMessage || viewOnceInner.audioMessage || 
-                           quotedMsg.imageMessage || quotedMsg.videoMessage || quotedMsg.audioMessage;
-
-      if (!mediaPayload) {
-        return reply('❌ El mensaje citado no parece ser un archivo multimedia de "Ver una sola vez".');
+      if (!buffer || !buffer.length) {
+        return reply('❌ El archivo multimedia está vacío.');
       }
 
       if (!isOwner) {
@@ -84,22 +126,20 @@ module.exports = {
         saveInv(dbInv);
       }
 
-      // 🚀 Reenvío directo nativo de WhatsApp (Sin guardar buffers ni caché)
-      await sock.sendMessage(remoteJid, {
-        forward: {
-          key: {
-            remoteJid,
-            fromMe: false,
-            id: quotedId,
-            participant: ctx?.participant || quoted?.key?.participant
-          },
-          message: quotedMsg
-        }
-      }, { quoted: msg });
+      const captionText = payload.caption ? `📝 *Texto:* ${payload.caption}` : '';
+
+      // 🚀 Envío limpio como archivo multimedia normal (Esto sí aparece siempre en el chat)
+      if (payload.type === 'image') {
+        await sock.sendMessage(remoteJid, { image: buffer, caption: captionText }, { quoted: msg });
+      } else if (payload.type === 'video') {
+        await sock.sendMessage(remoteJid, { video: buffer, caption: captionText }, { quoted: msg });
+      } else if (payload.type === 'audio') {
+        await sock.sendMessage(remoteJid, { audio: buffer, mimetype: payload.mimetype, ptt: true }, { quoted: msg });
+      }
 
     } catch (err) {
-      console.log('❌ Error al reenviar media en .ver:', err?.message || err);
-      return reply('❌ No se pudo reenviar el archivo. Es posible que el mensaje ya haya expirado completamente.');
+      console.log('❌ Error en comando .ver:', err?.message || err);
+      return reply('❌ Ocurrió un error al intentar revelar el archivo.');
     }
   }
 };
