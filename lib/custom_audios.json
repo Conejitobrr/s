@@ -4,5 +4,11 @@
       "nooo"
     ],
     "file": "nooo.mp3"
+  },
+  {
+    "triggers": [
+      "apura oe"
+    ],
+    "file": "apura oe.mp3"
   }
 ]
